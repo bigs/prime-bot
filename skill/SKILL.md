@@ -52,6 +52,18 @@ Only a depth-0 (root) agent can call `rlm.create_session`. If you are a sub-agen
 
 The bot goes live once it is linked and has both tokens, in either order.
 
+## Files and existing Slack apps
+
+The manifest includes `files:read` so incoming Slack images can be cached for the bot to view with `attach_image`, and `files:write` for outgoing uploads. Keep `files:read` for incoming images and add `files:write` for uploads. When upgrading an existing app, show the user `await prime_bot.manifest(name)` and ask them to update the Slack app's manifest/scopes and reinstall it. If uploads report a missing `files:write` scope, the user must add `files:write` to the Slack app and reinstall it. Updating the local binary/skill does not grant Slack scopes. If Slack changes either token, the user must re-enter it with `prime-bot secrets set <name>`, never through chat. Missing incoming file access produces image notes while text delivery continues.
+
+```python
+await prime_bot.upload(conversation, "/path/chart.png", text="Here is the chart.")
+```
+
+Uploads send one local regular file per call (any file type, up to 20 MiB) to an existing `<channel>/<thread_ts>` conversation or bare DM channel (`D...`), as with `reply()`. Relative paths and `~` resolve in the caller's cwd. The bridge reads the file and uses Slack's external upload flow; JSON-RPC carries the path, not file data. The result is `{channel, conversation, files: [{id, title, permalink}]}`, with no file content. Optional `title=` sets the display title. To start a new channel thread, call `posted = await prime_bot.post(channel, text)` first, then `await prime_bot.upload(posted["conversation"], path)`.
+
+Readable local files are available under the trusted Unix account. Follow user intent and do not upload secrets. Use `reply()`, `post()`, or `upload()` for Slack message output; `react()` also makes visible changes. Ordinary final answers are not sent to Slack.
+
 ## Status
 
 ```python

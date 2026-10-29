@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -117,6 +118,290 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         assert "result" in resp, resp
         await self.until(lambda: name in self.slack.sockets, f"{name} socket")
         return r
+
+    def image_paths(self, delivery):
+        header = delivery["text"].split("---\n", 1)[0]
+        self.assertIn("image_paths=", header)
+        paths, _ = json.JSONDecoder().raw_decode(header.split("image_paths=", 1)[1])
+        self.assertIsInstance(paths, list)
+        return [Path(p) for p in paths]
+
+    async def test_images_cache_private_files_and_deliver_empty_file_share(self):
+        await self.make_live("atlas", ["C1"])
+        image = self.slack.add_file("FIMAGE")
+        await self.push("atlas", msg("UOWNER", "", "1.0", channel="D1", channel_type="im",
+                                     subtype="file_share", files=[image]))
+        got = await self.settle()
+        self.assertEqual(len(got), 1)
+        expected = self.home / "attachments" / "atlas" / "FIMAGE.png"
+        self.assertEqual(self.image_paths(got[0]), [expected])
+        self.assertTrue(expected.is_absolute())
+        self.assertEqual(expected.read_bytes(), self.slack.png)
+        for directory in [expected.parent, expected.parent.parent]:
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(expected.stat().st_mode & 0o777, 0o600)
+        self.assertIn("attach_image", got[0]["text"].split("---\n", 1)[0])
+        self.assertTrue(got[0]["text"].endswith("---\n"))
+        self.assertEqual(self.slack.file_requests, [("FIMAGE", "Bearer xoxb-atlas")])
+        await self.push("atlas", msg("UOWNER", "same picture", "2.0", channel="D1", channel_type="im",
+                                     files=[image]))
+        got = await self.settle()
+        self.assertEqual(self.image_paths(got[0]), [expected])
+        self.assertTrue(got[0]["text"].endswith("---\nsame picture"))
+        self.assertEqual(len(self.slack.file_requests), 1)
+        self.assertEqual(list(expected.parent.iterdir()), [expected])
+
+    async def test_images_are_not_fetched_before_admission(self):
+        await self.make_live("atlas", ["C1"])
+        image = self.slack.add_file("FREJECTED")
+        for user, channel in [("USTRANGER", "C1"), ("UOWNER", "C2")]:
+            await self.push("atlas", msg(user, "<@UATLAS> private image", f"{self.events + 1}.0",
+                                         channel=channel, files=[image]))
+        # Metadata resolution must also happen only after admission.
+        await self.push("atlas", msg("USTRANGER", "<@UATLAS>", "3.0",
+                                     files=[{"id": "FREJECTED", "file_access": "check_file_info"}]))
+        self.assertEqual(await self.settle(), [])
+        self.assertEqual(self.slack.file_requests, [])
+        self.assertEqual(self.slack.calls_to("files.info"), [])
+        self.assertFalse((self.home / "attachments" / "atlas" / "FREJECTED.png").exists())
+
+    async def test_image_metadata_lookup_and_missing_scope_preserve_text(self):
+        await self.make_live("atlas", ["C1"])
+        self.slack.add_file("FLOOKUP")
+        self.slack.add_file("FNOSCOPE", info_error="missing_scope")
+        await self.push("atlas", msg("UOWNER", "metadata lookup", "1.0", channel="D1", channel_type="im",
+                                     files=[{"id": "FLOOKUP", "file_access": "check_file_info"}]))
+        got = await self.settle()
+        self.assertEqual([p.name for p in self.image_paths(got[0])], ["FLOOKUP.png"])
+        await self.push("atlas", msg("UOWNER", "keep this text", "2.0", channel="D1", channel_type="im",
+                                     files=[{"id": "FNOSCOPE", "file_access": "check_file_info"}]))
+        got = await self.settle()
+        self.assertEqual(len(got), 1)
+        self.assertIn("image_notes=", got[0]["text"].split("---\n", 1)[0])
+        self.assertTrue(got[0]["text"].endswith("---\nkeep this text"))
+        self.assertEqual([p["file"] for _, _, p in self.slack.calls_to("files.info")], ["FLOOKUP", "FNOSCOPE"])
+        self.assertEqual(self.slack.file_requests, [("FLOOKUP", "Bearer xoxb-atlas")])
+
+    async def test_image_failures_preserve_text_without_partial_cache_or_redirect(self):
+        await self.make_live("atlas", ["C1"])
+        target = self.slack.add_file("FTARGET")
+        cases = [
+            self.slack.add_file("FREDIRECT", redirect=target["url_private"]),
+            self.slack.add_file("FOVERSIZE", content_length=10 * 1024 * 1024 + 1),
+            self.slack.add_file("FHTTPERROR", status=403),
+            self.slack.add_file("FSVG", mimetype="image/svg+xml"),
+            self.slack.add_file("FMIMETYPE", content_type="text/html"),
+            self.slack.add_file("FBADBYTES", body=b"not a PNG"),
+            self.slack.add_file("FSTREAM", stream_oversize=True),
+        ]
+        other_host = self.slack.add_file("FOTHERHOST")
+        # A different host on the same local server is safe even if validation regresses:
+        # it never sends a test request to the public Internet.
+        other_host["url_private"] = other_host["url_private"].replace("127.0.0.1", "localhost")
+        cases.append(other_host)
+        for i, file in enumerate(cases):
+            body = f"retain text {i}"
+            await self.push("atlas", msg("UOWNER", body, f"{i + 1}.0", channel="D1", channel_type="im",
+                                         files=[file]))
+            got = await self.settle()
+            self.assertEqual(len(got), 1)
+            self.assertTrue(got[0]["text"].endswith("---\n" + body))
+            header = got[0]["text"].split("---\n", 1)[0]
+            self.assertIn("image_notes=", header)
+            if "image_paths=" in header:
+                self.assertEqual(self.image_paths(got[0]), [])
+        self.assertEqual([f for f, _ in self.slack.file_requests],
+                         ["FREDIRECT", "FOVERSIZE", "FHTTPERROR", "FMIMETYPE", "FBADBYTES", "FSTREAM"])
+        cache = self.home / "attachments" / "atlas"
+        self.assertEqual(list(cache.iterdir()) if cache.exists() else [], [])
+
+    async def test_image_limit_and_bound_session_fallback_keep_paths(self):
+        await self.make_live("atlas", ["C1"])
+        images = [self.slack.add_file(f"FLIMIT{i}") for i in range(5)]
+        await prime_bot.bind_thread("C1/1.0", "child-images", bot="atlas")
+        await self.push("atlas", msg("UOWNER", "<@UATLAS> inspect", "1.0", files=images))
+        got = await self.settle()
+        self.assertEqual([d["session"] for d in got], ["child-images"])
+        paths = self.image_paths(got[0])
+        self.assertEqual([p.name for p in paths], [f"FLIMIT{i}.png" for i in range(4)])
+        self.assertIn("image_notes=", got[0]["text"].split("---\n", 1)[0])
+        self.assertEqual(len(self.slack.file_requests), 4)
+        await prime_bot.bind_thread("C1/1.0", "dead-child", bot="atlas")
+        await self.push("atlas", msg("UOWNER", "fallback picture", "2.0", thread_ts="1.0", files=[images[0]]))
+        got = await self.settle()
+        self.assertEqual([d["session"] for d in got], ["session-atlas"])
+        self.assertEqual(self.image_paths(got[0]), paths[:1])
+        self.assertIn("dead-child", got[0]["text"])
+        self.assertEqual(len(self.slack.file_requests), 4)
+
+    async def test_upload_thread_sends_bytes_and_metadata_then_records_participation(self):
+        await self.make_live("atlas", ["C1"])
+        await self.make_live("nova", ["C1"])
+        path = Path(self.tmp.name) / "report.pdf"
+        payload = b"%PDF-1.7\nnonimage file\x00\xff\n"
+        path.write_bytes(payload)
+        with mock.patch.object(prime_bot, "_call", wraps=prime_bot._call) as rpc:
+            result = await prime_bot.upload("C1/10.0", str(path), text="Report attached",
+                                            title="Quarterly report", bot="nova")
+        self.assertEqual(rpc.await_args.args, ("upload",))
+        self.assertEqual(rpc.await_args.kwargs,
+                         {"bot": "nova", "conversation": "C1/10.0", "path": str(path),
+                          "text": "Report attached", "title": "Quarterly report"})
+        self.assertNotIn("%PDF", json.dumps(rpc.await_args.kwargs))
+        self.assertEqual(result, {"channel": "C1", "conversation": "C1/10.0",
+                                  "files": [{"id": "FUPLOAD1", "title": "Quarterly report",
+                                             "permalink": "https://files.slack.com/FUPLOAD1"}]})
+        self.assertEqual(self.slack.calls_to("files.getUploadURLExternal"),
+                         [("files.getUploadURLExternal", "xoxb-nova",
+                           {"filename": path.name, "length": str(len(payload))})])
+        self.assertEqual(self.slack.upload_requests,
+                         [{"id": "FUPLOAD1", "method": "POST", "authorization": None, "body": payload}])
+        complete = self.slack.calls_to("files.completeUploadExternal")
+        self.assertEqual(len(complete), 1)
+        _, token, params = complete[0]
+        self.assertEqual(token, "xoxb-nova")
+        self.assertEqual(json.loads(params["files"]), [{"id": "FUPLOAD1", "title": "Quarterly report"}])
+        self.assertEqual({k: v for k, v in params.items() if k != "files"},
+                         {"channel_id": "C1", "thread_ts": "10.0", "initial_comment": "Report attached"})
+        self.assertEqual(self.slack.calls_to("chat.postMessage"), [])
+        threads = (await prime_bot.list_threads(bot="nova"))["threads"]
+        self.assertIn("C1/10.0", [t["conversation"] for t in threads])
+        await self.push("nova", msg("UOWNER", "follow up without mention", "11.0", thread_ts="10.0"))
+        await self.push("atlas", msg("UOWNER", "follow up without mention", "11.0", thread_ts="10.0"))
+        got = await self.settle()
+        self.assertEqual([d["session"] for d in got], ["session-nova"])
+
+    async def test_upload_dm_defaults_and_exact_size_limit_with_inferred_bot(self):
+        created = await self.make_live("atlas", ["C1"])
+        await prime_bot.configure("atlas", dms=False)
+        path = Path(self.tmp.name) / "large.bin"
+        payload = b"\x00\xff" * (10 * 1024 * 1024)
+        path.write_bytes(payload)
+        previous = Path.cwd()
+        try:
+            os.chdir(created["dir"])
+            with mock.patch.object(prime_bot, "_call", wraps=prime_bot._call) as rpc:
+                result = await prime_bot.upload("D7", os.path.relpath(path))
+            self.assertEqual(rpc.await_args.kwargs["path"], str(path))
+        finally:
+            os.chdir(previous)
+        self.assertEqual(result, {"channel": "D7", "conversation": "D7",
+                                  "files": [{"id": "FUPLOAD1", "title": path.name,
+                                             "permalink": "https://files.slack.com/FUPLOAD1"}]})
+        self.assertEqual(self.slack.calls_to("files.getUploadURLExternal")[0][1:],
+                         ("xoxb-atlas", {"filename": path.name, "length": str(20 * 1024 * 1024)}))
+        self.assertEqual(self.slack.upload_requests,
+                         [{"id": "FUPLOAD1", "method": "POST", "authorization": None, "body": payload}])
+        complete = self.slack.calls_to("files.completeUploadExternal")[0]
+        self.assertEqual(complete[1], "xoxb-atlas")
+        self.assertEqual(json.loads(complete[2]["files"]), [{"id": "FUPLOAD1", "title": path.name}])
+        self.assertEqual({k: v for k, v in complete[2].items() if k != "files"}, {"channel_id": "D7"})
+
+    async def test_upload_unlisted_channel_uses_trusted_local_policy(self):
+        await self.make_live("atlas", ["C1"])
+        path = Path(self.tmp.name) / "note.txt"
+        path.write_text("explicit local upload")
+        result = await prime_bot.upload("C9/1.0", str(path), bot="atlas")
+        self.assertEqual((result["channel"], result["conversation"]), ("C9", "C9/1.0"))
+        threads = (await prime_bot.list_threads(bot="atlas"))["threads"]
+        self.assertIn("C9/1.0", [t["conversation"] for t in threads])
+        await self.push("atlas", msg("UOWNER", "<@UATLAS> still not subscribed", "2.0",
+                                     channel="C9", thread_ts="1.0"))
+        self.assertEqual(await self.settle(), [])
+        cfg = yaml.safe_load((self.home / "config.yaml").read_text())
+        self.assertEqual(cfg["bots"]["atlas"]["channels"], ["C1"])
+
+    async def test_upload_rejects_invalid_files_before_requesting_a_signed_url(self):
+        await self.make_live("atlas", ["C1"])
+        base = Path(self.tmp.name)
+        empty = base / "empty.bin"
+        empty.touch()
+        large = base / "too-large.bin"
+        with large.open("wb") as output:
+            output.truncate(20 * 1024 * 1024 + 1)
+        fifo = base / "pipe"
+        os.mkfifo(fifo)
+        valid = base / "valid.txt"
+        valid.write_text("relative paths are not RPC upload paths")
+        cases = ["", str(base / "missing"), str(empty), str(base), str(large), str(fifo)]
+        for path in cases:
+            with self.subTest(path=path):
+                with self.assertRaises(prime_bot.PrimeBotError):
+                    await prime_bot.upload("C1/1.0", path, bot="atlas")
+        # The wrapper resolves relative paths; the daemon requires absolute RPC paths.
+        with self.assertRaises(prime_bot.PrimeBotError):
+            await prime_bot._call("upload", bot="atlas", conversation="C1/1.0",
+                                  path=os.path.relpath(valid))
+        self.assertEqual(self.slack.calls_to("files.getUploadURLExternal"), [])
+        self.assertEqual(self.slack.upload_requests, [])
+        self.assertEqual(self.slack.calls_to("files.completeUploadExternal"), [])
+        threads = (await prime_bot.list_threads(bot="atlas"))["threads"]
+        self.assertNotIn("C1/1.0", [t["conversation"] for t in threads])
+
+    async def test_upload_scope_and_raw_http_failures_do_not_complete_or_participate(self):
+        await self.make_live("atlas", ["C1"])
+        path = Path(self.tmp.name) / "note.txt"
+        path.write_text("file content")
+        self.slack.upload_options = {"get_error": "missing_scope"}
+        with self.assertRaises(prime_bot.PrimeBotError) as error:
+            await prime_bot.upload("C1/1.0", str(path), bot="atlas")
+        self.assertIn("missing_scope", str(error.exception))
+        self.assertEqual(self.slack.upload_requests, [])
+        secret = "RAW_RESPONSE_MUST_NOT_LEAK"
+        self.slack.upload_options = {"status": 403, "body": secret.encode()}
+        with self.assertRaises(prime_bot.PrimeBotError) as error:
+            await prime_bot.upload("C1/2.0", str(path), bot="atlas")
+        self.assertEqual(len(self.slack.upload_requests), 1)
+        self.assertIsNone(self.slack.upload_requests[0]["authorization"])
+        self.assertEqual(self.slack.calls_to("files.completeUploadExternal"), [])
+        self.assertNotIn(secret, str(error.exception))
+        self.assertNotIn("/uploads/", str(error.exception))
+        self.assertNotIn(secret, (Path(self.tmp.name) / "daemon.log").read_text())
+        threads = (await prime_bot.list_threads(bot="atlas"))["threads"]
+        self.assertTrue({"C1/1.0", "C1/2.0"}.isdisjoint(t["conversation"] for t in threads))
+
+    async def test_upload_rejects_unsafe_signed_urls_and_does_not_follow_redirects(self):
+        await self.make_live("atlas", ["C1"])
+        path = Path(self.tmp.name) / "note.txt"
+        path.write_text("do not send to an unsafe target")
+        origin = f"http://127.0.0.1:{self.slack.port}"
+        secret = "SIGNED_UPLOAD_SECRET"
+        urls = [f"http://localhost:{self.slack.port}/uploads/leak?token={secret}",
+                f"ftp://127.0.0.1:{self.slack.port}/uploads/leak?token={secret}",
+                f"http://user:password@127.0.0.1:{self.slack.port}/uploads/leak?token={secret}"]
+        for i, url in enumerate(urls):
+            with self.subTest(url=url):
+                self.slack.upload_options = {"upload_url": url}
+                with self.assertRaises(prime_bot.PrimeBotError) as error:
+                    await prime_bot.upload(f"C1/{i + 1}.0", str(path), bot="atlas")
+                self.assertNotIn(secret, str(error.exception))
+                self.assertNotIn(url, str(error.exception))
+                self.assertNotIn("xoxb-atlas", str(error.exception))
+                self.assertNotIn("password", str(error.exception))
+        self.assertEqual(self.slack.upload_requests, [])
+        self.slack.upload_options = {"redirect": f"{origin}/uploads/leak?token={secret}"}
+        with self.assertRaises(prime_bot.PrimeBotError) as error:
+            await prime_bot.upload("C1/4.0", str(path), bot="atlas")
+        self.assertEqual(len(self.slack.upload_requests), 1)
+        self.assertEqual(self.slack.upload_requests[0]["method"], "POST")
+        self.assertIsNone(self.slack.upload_requests[0]["authorization"])
+        self.assertNotIn("leak", [r["id"] for r in self.slack.upload_requests])
+        self.assertEqual(self.slack.calls_to("files.completeUploadExternal"), [])
+        self.assertNotIn(secret, str(error.exception))
+        self.assertNotIn(secret, (Path(self.tmp.name) / "daemon.log").read_text())
+
+    async def test_upload_can_reuse_an_incoming_cached_image(self):
+        await self.make_live("atlas", ["C1"])
+        image = self.slack.add_file("FREUPLOAD")
+        await self.push("atlas", msg("UOWNER", "", "1.0", channel="D1", channel_type="im",
+                                     subtype="file_share", files=[image]))
+        got = await self.settle()
+        path = self.image_paths(got[0])[0]
+        result = await prime_bot.upload("C1/5.0", str(path), bot="atlas")
+        self.assertEqual(result["files"][0]["title"], "FREUPLOAD.png")
+        self.assertEqual(self.slack.upload_requests[0]["body"], self.slack.png)
+        self.assertIsNone(self.slack.upload_requests[0]["authorization"])
+        self.assertEqual(self.slack.file_requests, [("FREUPLOAD", "Bearer xoxb-atlas")])
 
     async def test_mentions_use_only_known_or_cached_names(self):
         await self.make_live("atlas", ["C1"])

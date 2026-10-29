@@ -33,6 +33,7 @@ __all__ = [
     "manifest",
     "reply",
     "post",
+    "upload",
     "thread_history",
     "list_threads",
     "react",
@@ -254,6 +255,44 @@ async def post(
         ``{channel, ts, conversation}``.
     """
     return await _call("post", bot=_bot(bot), channel=channel, text=text, thread_ts=thread_ts)
+
+
+async def upload(
+    conversation: str,
+    path: str | os.PathLike[str],
+    *,
+    text: str | None = None,
+    title: str | None = None,
+    bot: str | None = None,
+) -> dict:
+    """Upload one local regular file (any type, up to 20 MiB) to Slack.
+
+    Args:
+        conversation: ``<channel>/<thread_ts>`` for an existing thread or a
+            bare DM channel (``D...``), as with ``reply``. To start a new
+            channel thread, call ``post`` first and use its ``conversation``.
+        path: Local file path, expanded and resolved relative to the caller's
+            cwd. Only the absolute path is sent over JSON-RPC, not file data.
+        text: Optional Slack mrkdwn message accompanying the file.
+        title: Optional display title.
+        bot: Bot name; inferred from the cwd when omitted.
+
+    Requires the Slack app's ``files:write`` scope. The daemon reads the file
+    under the same trusted Unix account; follow user intent and do not upload
+    secrets. The bridge uses Slack's external upload flow.
+
+    Returns:
+        ``{channel, conversation, files: [{id, title, permalink}]}``.
+        No file content is returned.
+    """
+    return await _call(
+        "upload",
+        bot=_bot(bot),
+        conversation=conversation,
+        path=str(Path(path).expanduser().resolve()),
+        text=text,
+        title=title,
+    )
 
 
 async def thread_history(

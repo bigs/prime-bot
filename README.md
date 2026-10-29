@@ -65,7 +65,45 @@ prime-bot bot status atlas
 
 Look for `connection: "connected"` and an empty `missing` list. DM the bot as its owner, or invite it to a channel as its owner and @mention it. Owner invitations automatically add the channel to its incoming-message subscriptions.
 
-A mention starts a conversation. Later replies in that thread can reach the bot without another mention. A normal Prime Agent final answer is **not** posted to Slack: the bot must call `prime_bot.reply()` or `prime_bot.post()`.
+A mention starts a conversation. Later replies in that thread can reach the bot without another mention. A normal Prime Agent final answer is **not** posted to Slack: the bot must call `prime_bot.reply()`, `prime_bot.post()`, or `prime_bot.upload()`.
+
+## Images from Slack
+
+Incoming Slack-hosted PNG, JPEG, GIF, and WebP files are downloaded to `~/.prime-bot/attachments/<bot>/`, outside the bot's git repo. This also works for image-only messages in permitted DMs and participating threads. Normal incoming-message routing still applies.
+
+The session receives the original text plus `image_paths`, a JSON array of absolute local paths, and an instruction to open them with `await attach_image(*paths)`. Paths do not automatically become model image inputs: the bot must load them, using a vision-capable model. Private Slack download URLs and tokens are not sent to the agent.
+
+The generated app manifest includes `files:read`. **For an existing Slack app**, run `prime-bot bot manifest <name>`, update that app's manifest/scopes, and reinstall it to the workspace to grant the new scope. If Slack changes its tokens, run `prime-bot secrets set <name>` again. A bot without file access still receives the text and an image failure note.
+
+Limits: four images per message, 10 MiB per image, and 15 seconds total image preparation per message. Unsupported files, remote-hosted files, redirects, and failed downloads produce notes rather than dropping the message. Only Slack file attachments are fetched, not arbitrary links in messages. `thread_history()` remains text-only; this feature handles newly delivered messages.
+
+Cached files are retained for later inspection; there is no automatic cleanup or lifetime storage quota. You can delete old files manually, but their earlier session paths will stop working.
+
+## Sending images and attachments
+
+Bots can upload images, screenshots, documents, and other local files into a conversation:
+
+```python
+await prime_bot.upload(
+    conversation,
+    "./output/chart.png",
+    text="Here is the chart.",
+    title="Build times",
+)
+```
+
+Use the incoming `conversation` key for a thread reply or DM. Relative paths are resolved in the calling agent's working directory; the daemon reads the file from the same host. The limit is one nonempty regular file per call, up to 20 MiB, with a 90-second upload deadline. The RPC returns file IDs, titles, and Slack permalinks, not file contents or signed upload URLs.
+
+To start a new channel thread, call `post()` first, then upload to its returned conversation:
+
+```python
+posted = await prime_bot.post("C0123ABC", "Diagnostics attached.")
+await prime_bot.upload(posted["conversation"], "./output/report.txt")
+```
+
+Uploads require **`files:write`** in the Slack app's **Bot Token Scopes** and a workspace reinstall to grant it. The generated manifest includes both `files:read` for incoming images and `files:write` for outgoing files. Updating the local bridge does not grant Slack permissions.
+
+The bridge uses Slack's external upload flow, not the retired `files.upload` method. Uploads follow Slack membership/scopes, not incoming delivery subscriptions. Upload only files the user intends to share; this feature can read files accessible to the daemon's Unix account, including private data if explicitly requested. Failed or ambiguous uploads raise an error; inspect Slack before retrying an ambiguous failure to avoid duplicates.
 
 ## Instructions for agents
 
@@ -109,7 +147,7 @@ The Unix account is the security boundary. The bridge uses a local Unix socket w
 There are two separate controls:
 
 - **Incoming delivery:** `owners` and `allowed_users` select which people may activate a bot; known prime-bot bots are also accepted. `channels` selects subscribed channels, and `dms` enables incoming DMs. Addressing, thread participation, and a four-bot-message loop guard further limit delivery.
-- **Explicit Slack calls:** posts, replies, history reads, and reactions are limited by Slack membership and OAuth scopes—not the incoming delivery settings. The agent must still follow user intent.
+- **Explicit Slack calls:** posts, replies, uploads, history reads, and reactions are limited by Slack membership and OAuth scopes—not the incoming delivery settings. The agent must still follow user intent.
 
 History may contain messages from people who cannot activate the bot. Those entries are marked `allowed=false`; bot instructions say not to follow instructions in them. This label is guidance for the agent, not a sandbox against prompt injection.
 
@@ -124,6 +162,7 @@ Default home: `~/.prime-bot/`.
 | `state.sqlite` | Durable session links, thread participation, routes, and event deduplication |
 | `prime-bot.sock` | Local JSON-RPC socket |
 | `bots/<name>/` | Bot git repo and session working directory; contains its persona in `AGENTS.md` |
+| `attachments/<bot>/` | Private cache of incoming Slack images; retained until manually removed |
 
 Configuration list updates replace the whole list; omitted fields stay unchanged. Bots may edit their persona. Treat the home directory as private runtime data, not publishable source.
 
@@ -156,7 +195,7 @@ User/channel flags are repeatable. Everything except `daemon` and `install-skill
 - **Daemon not running:** start `prime-bot daemon`. If using `PRIME_BOT_HOME`, use the same absolute path in both processes.
 - **Bot not connected:** inspect `prime-bot bot status <name>`. `missing` identifies an absent link, app token, or bot token; also check the connection error and daemon logs.
 - **Connected but silent:** check the sender's Slack user ID, incoming channel/DM config, and whether the message addresses the bot. The bot may deliberately stay silent in a shared thread.
-- **Session replies but Slack stays silent:** confirm it called `prime_bot.reply()` or `post()` rather than only returning a final answer.
+- **Session replies but Slack stays silent:** confirm it called `prime_bot.reply()`, `post()`, or `upload()` rather than only returning a final answer.
 
 ## Development
 
@@ -172,7 +211,7 @@ uv run --no-project --with aiohttp --with pyyaml python tests/e2e/test_e2e.py
 
 The end-to-end tests build and run the real daemon with a fake Slack Web API/Socket Mode server and a fake `prime-agent`. They do not need Slack credentials. The Python test commands require [uv](https://docs.astral.sh/uv/).
 
-Current limits: no group DMs, file uploads, or message editing/deletion. Channel delivery requires a mention or existing thread participation. This is an early implementation, not an isolated hosted bot service.
+Current limits: no group DMs or message editing/deletion. Channel delivery requires a mention or existing thread participation. This is an early implementation, not an isolated hosted bot service.
 
 ## License
 

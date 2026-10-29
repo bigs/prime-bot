@@ -41,15 +41,22 @@ Result: `{bots: [BotStatus]}` where `BotStatus` is
 
 **`secrets_set`** `{bot, app_token, bot_token}` → `{bot}`. Intended for the hidden-input CLI workflow; same-user socket clients are not assigned separate roles.
 
+### Incoming image delivery (not an RPC method)
+
+Incoming session headers may include `image_paths` (JSON array of absolute cached image paths) and `image_notes` (JSON array of preparation failures/skips). The agent uses `attach_image` to view the files. Images use the existing text-message session routing and are not uploaded through these RPC methods. `thread_history` below remains text-only.
+
 ### Acting in Slack
 
-Slack API calls require the bot to be live. `channels` and `dms` configure incoming message delivery only; they do not restrict explicit posting, replies, history reads, or reactions. Slack membership and scopes govern access.
+Slack API calls require the bot to be live. `channels` and `dms` configure incoming message delivery only; they do not restrict explicit posting, replies, uploads, history reads, or reactions. Slack membership and scopes govern access.
 
 **`reply`** `{bot, conversation, text}` — post into a conversation: a thread reply, or a plain DM message for a DM conversation. Marks the bot as participating.
 Result: `{channel, ts, conversation}`
 
 **`post`** `{bot, channel, text, thread_ts?}` — post anywhere permitted by Slack membership and scopes. Without `thread_ts`, starts a new top-level message whose thread the bot participates in.
 Result: `{channel, ts, conversation}`
+
+**`upload`** `{bot, conversation, path, title?, text?}` — upload one local file to an existing thread or DM. `conversation` has the same syntax as `reply`. `path` must be absolute at the RPC boundary; the Python client expands `~` and resolves relative paths in its own cwd. Requires `files:write` and a nonempty regular file of at most 20 MiB. Uses `files.getUploadURLExternal`, a binary upload to the signed URL without a bot Authorization header, and `files.completeUploadExternal` with the channel/thread and optional initial comment. A successful upload records conversation participation. The whole operation has a 90-second deadline; ambiguous failures are not automatically retried.
+Result: `{channel, conversation, files: [{id, title, permalink}]}`. File metadata may be null when Slack omits it. Signed upload URLs and local file contents are not returned. Like other explicit Slack calls, incoming channel/DM subscriptions do not restrict uploads. To start a new channel thread, `post` first and upload to its returned conversation.
 
 **`thread_history`** `{bot, conversation, cursor?, limit?: int = 50}` (limit 1-200) — each page sorted oldest first. For a thread: `conversations.replies`; `next_cursor` moves to newer replies. For a DM: `conversations.history` (top-level DM messages); the first page holds the newest messages and `next_cursor` moves to older ones.
 Result: `{messages: [Message], next_cursor: string|null}` where `Message` is

@@ -71,6 +71,41 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.last["method"], "post")
         self.assertEqual(self.last["params"], {"bot": "atlas", "channel": "C1", "text": "hi"})
 
+    async def test_upload_request_shape(self):
+        expected = {
+            "channel": "C1",
+            "conversation": "C1/1.2",
+            "files": [{"id": "F1", "title": "Chart", "permalink": "https://slack.example/F1"}],
+        }
+        self.daemon.responses["upload"] = {"result": expected}
+        path = self.home / "chart.png"
+        result = await prime_bot.upload(
+            "C1/1.2", path, text="Here is the chart.", title="Chart", bot="atlas"
+        )
+        self.assertEqual(result, expected)
+        self.assertEqual(self.last["method"], "upload")
+        self.assertEqual(
+            self.last["params"],
+            {"bot": "atlas", "conversation": "C1/1.2", "path": str(path),
+             "text": "Here is the chart.", "title": "Chart"},
+        )
+
+    async def test_upload_relative_path_and_bot_inference(self):
+        cwd = self.home / "bots" / "atlas" / "sub"
+        os.chdir(cwd)
+        await prime_bot.upload("D1", "../report.pdf")
+        self.assertEqual(
+            self.last["params"],
+            {"bot": "atlas", "conversation": "D1", "path": str(cwd.parent / "report.pdf")},
+        )
+
+    async def test_upload_expands_home(self):
+        await prime_bot.upload("D1", "~/chart.png", bot="nova")
+        self.assertEqual(
+            self.last["params"],
+            {"bot": "nova", "conversation": "D1", "path": str(Path.home() / "chart.png")},
+        )
+
     async def test_create_params(self):
         await prime_bot.create("atlas", ["U1"], "Helpful.", channels=["C1"], dms=False)
         self.assertEqual(self.last["method"], "create")

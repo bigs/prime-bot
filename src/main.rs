@@ -1,3 +1,4 @@
+mod attachments;
 mod config;
 mod conversation;
 mod daemon;

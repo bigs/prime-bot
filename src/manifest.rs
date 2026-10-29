@@ -23,6 +23,8 @@ oauth_config:
       - groups:read
       - im:read
       - users:read
+      - files:read
+      - files:write
       - reactions:write
       - channels:manage
       - groups:write
@@ -55,5 +57,9 @@ mod tests {
             v["features"]["bot_user"]["display_name"].as_str(),
             Some("atlas")
         );
+        let scopes = v["oauth_config"]["scopes"]["bot"].as_sequence().unwrap();
+        for required in ["files:read", "files:write"] {
+            assert!(scopes.iter().any(|scope| scope.as_str() == Some(required)));
+        }
     }
 }

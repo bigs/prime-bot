@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::attachments;
 use crate::config::{self, BotConfig, BotSecrets, Config, Secrets};
 use crate::conversation::Conversation;
 use crate::header::{self, Header};
@@ -62,6 +63,7 @@ struct Delivery {
     ts: String,
     header: Header,
     text: String,
+    files: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -411,6 +413,8 @@ impl Daemon {
             addressed_to_you,
             other_bots,
             note: None,
+            image_paths: Vec::new(),
+            image_notes: Vec::new(),
         };
         let delivery = Delivery {
             conversation,
@@ -418,6 +422,7 @@ impl Daemon {
             ts: msg.ts.clone(),
             header,
             text: msg.text,
+            files: event["files"].as_array().cloned().unwrap_or_default(),
         };
         deliveries
             .send(delivery)
@@ -427,6 +432,13 @@ impl Daemon {
     }
 
     async fn deliver(&self, bot: &Arc<Bot>, mut d: Delivery) {
+        let images = attachments::save_images(&self.home, &bot.name, &bot.api, &d.files).await;
+        d.header.image_paths = images
+            .images
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        d.header.image_notes = images.notes;
         let (route, root) = {
             let state = self.state.lock().unwrap();
             (
@@ -606,6 +618,7 @@ impl Daemon {
             "secrets_set" => self.secrets_set(parse(params)?).await,
             "reply" => self.reply(parse(params)?).await,
             "post" => self.post(parse(params)?).await,
+            "upload" => self.upload(parse(params)?).await,
             "thread_history" => self.thread_history(parse(params)?).await,
             "list_threads" => self.list_threads(parse(params)?),
             "react" => self.react(parse(params)?).await,
@@ -811,6 +824,26 @@ impl Daemon {
         Ok(json!({ "channel": p.channel, "ts": ts, "conversation": conv.to_string() }))
     }
 
+    async fn upload(&self, p: UploadParams) -> Result<Value, RpcError> {
+        let conv = Conversation::parse(&p.conversation)?;
+        let bot = self.live(&p.bot).await?;
+        let files = bot
+            .api
+            .upload_file(
+                &conv.channel,
+                conv.thread_ts.as_deref(),
+                &p.path,
+                p.title.as_deref(),
+                p.text.as_deref(),
+            )
+            .await?;
+        self.state
+            .lock()
+            .unwrap()
+            .touch(&p.bot, &conv, true, now())?;
+        Ok(json!({ "channel": conv.channel, "conversation": conv.to_string(), "files": files }))
+    }
+
     async fn thread_history(&self, p: HistoryParams) -> Result<Value, RpcError> {
         let bot = self.live(&p.bot).await?;
         let config = self.bot_config(&p.bot)?;
@@ -1004,6 +1037,16 @@ struct PostParams {
     channel: String,
     text: String,
     thread_ts: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadParams {
+    bot: String,
+    conversation: String,
+    path: std::path::PathBuf,
+    title: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Deserialize)]
